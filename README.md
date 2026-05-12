@@ -1445,7 +1445,7 @@ C4Component
 
 #### Code Diagram 1 - WalletService Business Logic
 
-```
+```mermaid
 classDiagram
 
     class WalletController {
@@ -1494,7 +1494,7 @@ classDiagram
 
 #### Code Diagram 2 - Wallet Event Publishing
 
-```
+```mermaid
 classDiagram
 
     class BalanceHeldEvent {
@@ -1544,7 +1544,7 @@ classDiagram
 
 #### Code Diagram 3 - Wallet Domain Entities
 
-```
+```mermaid
 classDiagram
 
     class Wallet {
