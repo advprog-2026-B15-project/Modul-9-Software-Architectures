@@ -503,3 +503,278 @@ classDiagram
     NotificationPreferenceRepository --> NotificationPreference : manages
     Notification --> NotificationType : type
 ```
+
+### Individual Work Keisha Vania Laurent (2406437331)
+
+Container yang dikerjakan: **Auction Service** (Spring Boot 3.5.11) — menangani proses inti lelang, pengelolaan penawaran harga (bid) dengan concurrency control (*anti-sniping* & distributed lock), dan penjadwalan otomatis penutupan lelang. Service ini adalah *producer* event utama ke RabbitMQ (BidPlaced, WinnerDetermined, AuctionClosed) dan berkomunikasi dengan Wallet Service untuk menahan (hold) saldo.
+
+#### Component Diagram — Auction Service
+
+```mermaid
+C4Component
+    title Component Diagram — Auction Service
+
+    Person(seller, "Seller", "Pembuat lelang")
+    Person(buyer, "Buyer", "Peserta lelang")
+
+    Container_Boundary(auction_api, "Auction Service") {
+        Component(auction_ctrl, "AuctionController", "Spring @RestController\n/api/auctions/**", "Endpoint REST untuk pembuatan lelang, aktivasi, dan penawaran (bid).")
+        
+        Component(auction_svc, "AuctionService", "Spring @Service", "Menangani logika inti lelang, validasi anti-sniping, dan memproses penempatan bid.")
+        
+        Component(closure_scheduler, "AuctionClosingScheduler", "Spring @Scheduled", "Job periodik (cron) untuk mendeteksi lelang yang telah melewati batas waktu (end_time).")
+        
+        Component(closure_svc, "AuctionClosureService", "Spring @Service", "Memproses penutupan lelang secara aman menggunakan distributed lock (Redisson).")
+        
+        Component(closure_db_svc, "AuctionClosureDatabaseService", "Spring @Service", "Mendelegasikan update status akhir lelang ke database secara transaksional (@Transactional).")
+        
+        Component(lock_template, "DistributedLockTemplate", "Redisson Component", "Mengelola distributed locking via Redis untuk mencegah race condition saat bid/closure.")
+        
+        Component(wallet_adapter, "WalletRestAdapter", "Spring @Component", "Berkomunikasi dengan eksternal Wallet Service untuk request hold saldo via RestClient.")
+        
+        Component(event_publisher, "RabbitMqAuctionEventPublisher", "Spring @Component", "Mempublikasikan event (BidPlaced, WinnerDetermined, dll) ke Message Broker.")
+        
+        Component(auction_repo, "AuctionRepository", "Spring Data JPA", "R/W data lelang ke DB.")
+        Component(bid_repo, "BidRepository", "Spring Data JPA", "R/W riwayat bid ke DB.")
+    }
+
+    ContainerDb(auction_db, "Auction DB", "Neon DB Serverless", "Tabel: auctions, bids")
+    Container(redis, "Distributed Lock", "Upstash Redis", "Distributed lock storage")
+    Container(mq, "Message Broker", "CloudAMQP RabbitMQ", "Event-driven broker")
+    Container(gateway, "API Gateway", "Nginx / Kong", "Entry point request")
+    Container(wallet_api, "Wallet Service", "Spring Boot", "Layanan dompet eksternal")
+
+    Rel(seller, gateway, "Membuat & aktivasi lelang", "HTTPS")
+    Rel(buyer, gateway, "Melakukan bid", "HTTPS")
+    Rel(gateway, auction_ctrl, "Route /api/auctions/**", "REST/JSON")
+
+    Rel(auction_ctrl, auction_svc, "Delegasi business logic", "Method call")
+    Rel(auction_svc, lock_template, "Acquire lock sebelum bid", "Method call")
+    Rel(auction_svc, wallet_adapter, "Request hold saldo", "Method call")
+    Rel(auction_svc, event_publisher, "Publish BidPlaced", "Method call")
+    Rel(auction_svc, auction_repo, "R/W data lelang", "JPA")
+    Rel(auction_svc, bid_repo, "R/W riwayat bid", "JPA")
+    
+    Rel(closure_scheduler, closure_svc, "Trigger evaluasi lelang", "Method call")
+    Rel(closure_svc, lock_template, "Acquire lock sebelum close", "Method call")
+    Rel(closure_svc, closure_db_svc, "Delegasi DB Tx", "Method call")
+    Rel(closure_db_svc, event_publisher, "Publish WinnerDetermined", "Method call")
+    Rel(closure_db_svc, auction_repo, "Update status lelang", "JPA")
+    
+    Rel(auction_repo, auction_db, "SQL", "JDBC/TCP")
+    Rel(bid_repo, auction_db, "SQL", "JDBC/TCP")
+    Rel(lock_template, redis, "Acquire/Release lock", "RESP/TLS")
+    Rel(wallet_adapter, wallet_api, "HTTP POST /internal/wallet/hold", "REST")
+    Rel(event_publisher, mq, "Publish events", "AMQP")
+```
+
+#### Code Diagram 1 — AuctionService
+
+```mermaid
+classDiagram
+    class AuctionController {
+        -AuctionService auctionService
+        +create(req: CreateAuctionRequest, sellerId: String) AuctionResponse
+        +activate(id: String, sellerId: String) AuctionResponse
+        +placeBid(id: String, req: PlaceBidRequest, bidderId: String) BidResponse
+    }
+
+    class AuctionService {
+        -AuctionRepository auctionRepository
+        -BidRepository bidRepository
+        -List~BidValidationStrategy~ validationStrategies
+        -HoldBalancePort holdBalancePort
+        -AuctionEventPort auctionEventPort
+        -DistributedLockTemplate lockTemplate
+        +create(req: CreateAuctionRequest, sellerId: String) Auction
+        +activate(auctionId: String, sellerId: String) Auction
+        +placeBid(auctionId: String, bidderId: String, amount: Long) Bid
+    }
+
+    class HoldBalancePort {
+        <<interface>>
+        +holdBalance(userId: String, auctionId: String, amount: Long) void
+    }
+
+    class AuctionEventPort {
+        <<interface>>
+        +publishBidPlaced(event: BidPlacedEvent) void
+        +publishWinnerDetermined(...) void
+    }
+
+    class DistributedLockTemplate {
+        +executeWithLock(lockKey: String, waitTime: long, leaseTime: long, unit: TimeUnit, supplier: Supplier~T~) T
+    }
+
+    class BidValidationStrategy {
+        <<interface>>
+        +validate(auction: Auction, amount: Long) void
+    }
+
+    AuctionController --> AuctionService : uses
+    AuctionService --> HoldBalancePort : uses
+    AuctionService --> AuctionEventPort : uses
+    AuctionService --> DistributedLockTemplate : uses
+    AuctionService --> BidValidationStrategy : uses
+```
+
+#### Code Diagram 2 — AuctionClosureService
+
+```mermaid
+classDiagram
+    class AuctionClosingScheduler {
+        -AuctionRepository auctionRepository
+        -AuctionClosureService closureService
+        +scheduleAuctionClosure() void
+    }
+
+    class AuctionClosureService {
+        -DistributedLockTemplate lockTemplate
+        -AuctionClosureDatabaseService auctionClosureDatabaseService
+        +processAuctionClosure(auction: Auction, closedAt: OffsetDateTime) void
+    }
+
+    class AuctionClosureDatabaseService {
+        -AuctionRepository auctionRepository
+        -BidRepository bidRepository
+        -AuctionEventPort auctionEventPort
+        +closeAuction(auctionId: String, closedAt: OffsetDateTime) void
+        -publishWinnerEvent(...) void
+        -publishClosedEvent(...) void
+    }
+
+    AuctionClosingScheduler --> AuctionClosureService : triggers
+    AuctionClosureService --> DistributedLockTemplate : uses
+    AuctionClosureService --> AuctionClosureDatabaseService : delegates Tx
+```
+
+#### Code Diagram 3 — Domain Entities
+
+```mermaid
+classDiagram
+    class Auction {
+        -String id
+        -String title
+        -Long startingPrice
+        -Long reservePrice
+        -Long minimumIncrement
+        -Long currentPrice
+        -AuctionStatus status
+        -OffsetDateTime endTime
+        -String listingId
+        -String sellerId
+        +prePersist() void
+        +preUpdate() void
+    }
+
+    class Bid {
+        -String id
+        -Auction auction
+        -String bidderId
+        -Long amount
+        -OffsetDateTime createdAt
+        +prePersist() void
+    }
+
+    class AuctionStatus {
+        <<enumeration>>
+        DRAFT
+        ACTIVE
+        EXTENDED
+        CLOSED
+        WON
+        UNSOLD
+    }
+
+    Auction --> AuctionStatus : defines status
+    Bid --> Auction : references
+```
+
+#### Bonus: Additional Component Diagram — Web Application (Frontend)
+
+```mermaid
+C4Component
+    title Component Diagram — Web Application (Frontend)
+
+    Person(buyer, "Buyer / Bidder", "Pengguna aplikasi")
+    Person(seller, "Seller", "Pengguna aplikasi")
+
+    Container_Boundary(frontend_app, "Web Application") {
+        Component(app_router, "App Router Layer", "Next.js Pages (src/app)", "Menangani routing halaman (contoh: /auctions/[id]) dan integrasi tata letak UI.")
+        Component(ui_components, "UI Components", "React Components (src/components)", "Komponen presentasional yang dapat digunakan kembali (ProductCard, BiddingForm, NavBar).")
+        
+        Component(module_auth, "Auth Module", "Service Logic (src/modules/auth)", "Menangani logika pemanggilan API otentikasi (login, register, session).")
+        Component(module_catalog, "Catalog Module", "Service Logic (src/modules/catalog)", "Menangani logika pemanggilan API katalog barang dan pencarian.")
+        Component(module_auction, "Auction Module", "Service Logic (src/modules/auction)", "Menangani pemanggilan API (fetch data) dan manajemen state khusus domain lelang.")
+        Component(module_wallet, "Wallet Module", "Service Logic (src/modules/wallet)", "Menangani logika pemanggilan API dompet (cek saldo, top-up).")
+        Component(module_booking, "Booking Module", "Service Logic (src/modules/booking)", "Menangani logika pemanggilan API status pesanan dan pengiriman.")
+        
+        Component(config_lib, "Config & Utilities", "TypeScript (src/lib)", "Menyimpan konfigurasi URL dan instance pemanggil HTTP asinkron (Axios/Fetch).")
+    }
+
+    Container(auth_api, "Auth Service", "Spring Boot", "Layanan backend otentikasi")
+    Container(catalog_api, "Catalog Service", "Spring Boot", "Layanan backend katalog")
+    Container(auction_api, "Auction Service", "Spring Boot", "Layanan backend lelang")
+    Container(wallet_api, "Wallet Service", "Spring Boot", "Layanan backend dompet")
+    Container(booking_api, "Booking Service", "Spring Boot", "Layanan backend pesanan")
+
+    Rel(buyer, app_router, "Akses halaman, klik bid, cek saldo", "HTTPS")
+    Rel(seller, app_router, "Kelola lelang dan pengiriman", "HTTPS")
+    
+    Rel(app_router, ui_components, "Merender UI", "React Props")
+    Rel(app_router, module_auth, "Delegasi operasi auth", "Method call")
+    Rel(app_router, module_catalog, "Delegasi ambil produk", "Method call")
+    Rel(app_router, module_auction, "Delegasi getAuction / placeBid", "Method call")
+    Rel(app_router, module_wallet, "Delegasi getBalance", "Method call")
+    Rel(app_router, module_booking, "Delegasi lacak pesanan", "Method call")
+    
+    Rel(module_auth, config_lib, "Ambil config URL", "Method call")
+    Rel(module_catalog, config_lib, "Ambil config URL", "Method call")
+    Rel(module_auction, config_lib, "Ambil config URL", "Method call")
+    Rel(module_wallet, config_lib, "Ambil config URL", "Method call")
+    Rel(module_booking, config_lib, "Ambil config URL", "Method call")
+    
+    Rel(module_auth, auth_api, "REST API Auth", "JSON/HTTPS")
+    Rel(module_catalog, catalog_api, "REST API Katalog", "JSON/HTTPS")
+    Rel(module_auction, auction_api, "REST API Lelang", "JSON/HTTPS")
+    Rel(module_wallet, wallet_api, "REST API Dompet", "JSON/HTTPS")
+    Rel(module_booking, booking_api, "REST API Pesanan", "JSON/HTTPS")
+```
+
+#### Bonus: Additional Code Diagram — Auction Module
+
+```mermaid
+classDiagram
+    class AuctionPage {
+        <<Next.js Page>>
+        -String auctionId
+        -AuctionState state
+        +render() JSX.Element
+        +handleBidSubmit(amount: number) void
+    }
+
+    class BiddingFormUI {
+        <<React Component>>
+        -number currentPrice
+        -function onSubmit
+        +render() JSX.Element
+    }
+
+    class AuctionModule {
+        <<Service/Hook>>
+        -String baseUrl
+        +getAuctionDetails(id: String) Promise~AuctionData~
+        +placeBid(id: String, amount: number) Promise~BidResponse~
+        +getBidHistory(id: String) Promise~BidHistory[]~
+    }
+
+    class ApiConfig {
+        <<Utility>>
+        +String AUCTION_API_URL
+        +fetchWithAuth(url: String, options: Object) Promise~Response~
+    }
+
+    AuctionPage --> BiddingFormUI : uses
+    AuctionPage --> AuctionModule : calls
+    AuctionModule --> ApiConfig : depends on
+```
