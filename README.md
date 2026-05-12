@@ -1385,3 +1385,212 @@ classDiagram
     RefreshToken --> User : belongs to
 
 ```
+
+
+
+### Individual Work Arya Novalino Pratama (2406495590)
+
+Container yang dikerjakan: Wallet Service (Spring Boot 3.5.11 + PostgreSQL), menangani pengelolaan saldo pengguna, transaksi top up dan withdraw, penahanan saldo saat bidding berlangsung, pelepasan saldo ketika pengguna kalah lelang, serta konversi saldo tertahan menjadi pembayaran ketika pengguna memenangkan lelang. Service ini juga menyediakan audit trail transaksi dan event publishing untuk integrasi asynchronous dengan module lain.
+
+-----------------------
+
+#### Component Diagram - Wallet Service
+
+```mermaid
+C4Component
+    title Component Diagram - Wallet Service (Wallet and Balance Management)
+
+    Person(user, "User / Client", "Pengguna platform BidMart")
+
+    Container_Boundary(wallet_api, "Wallet Service") {
+
+        Component(wallet_ctrl, "WalletController", "Spring @RestController", "Endpoint publik untuk top up, withdraw, dan melihat wallet pengguna.")
+
+        Component(internal_ctrl, "InternalWalletController", "Spring @RestController", "Endpoint internal untuk hold, release, dan convert payment dari Auction Module.")
+
+        Component(wallet_svc, "WalletService", "Spring @Service", "Business logic wallet, validasi saldo, audit trail, idempotency, dan event publishing.")
+
+        Component(wallet_repo, "WalletRepository", "Spring Data JPA", "Mengelola data wallet pengguna.")
+
+        Component(tx_repo, "WalletTransactionRepository", "Spring Data JPA", "Menyimpan immutable transaction logs.")
+
+        Component(event_pub, "ApplicationEventPublisher", "Spring Event Publisher", "Mempublikasikan wallet events ke module lain.")
+
+        Component(event_listener, "WalletEventListener", "Spring @Component", "Consumer internal untuk wallet events.")
+    }
+
+    ContainerDb(wallet_db, "Wallet DB", "PostgreSQL", "Tabel: wallets, wallet_transactions")
+
+    Container(auction, "Auction Service", "Spring Boot", "Mengelola bidding dan auction lifecycle")
+
+    Container(notification, "Notification Service", "Spring Boot", "Mengirim notifikasi transaksi")
+
+    Rel(user, wallet_ctrl, "REST API", "HTTPS")
+    Rel(auction, internal_ctrl, "Internal API", "REST")
+
+    Rel(wallet_ctrl, wallet_svc, "Method call")
+    Rel(internal_ctrl, wallet_svc, "Method call")
+
+    Rel(wallet_svc, wallet_repo, "R/W wallet")
+    Rel(wallet_svc, tx_repo, "Store transaction logs")
+
+    Rel(wallet_repo, wallet_db, "SQL", "JDBC")
+    Rel(tx_repo, wallet_db, "SQL", "JDBC")
+
+    Rel(wallet_svc, event_pub, "Publish events")
+    Rel(event_pub, event_listener, "Spring Events")
+
+    Rel(event_pub, notification, "Wallet events")
+```
+
+#### Code Diagram 1 - WalletService Business Logic
+
+```
+classDiagram
+
+    class WalletController {
+        -WalletService walletService
+        +getWallet(userId: String)
+        +topUp(userId: String, amount: BigDecimal)
+        +withdraw(userId: String, amount: BigDecimal)
+    }
+
+    class InternalWalletController {
+        -WalletService walletService
+        +holdBalance(userId: String, amount: BigDecimal, auctId: String)
+        +releaseBalance(userId: String, amount: BigDecimal, auctId: String)
+        +convertToPayment(userId: String, amount: BigDecimal, auctId: String)
+    }
+
+    class WalletService {
+        -WalletRepository walletRepository
+        -WalletTransactionRepository transactionRepository
+        -ApplicationEventPublisher eventPublisher
+
+        +createWallet(userId: String)
+        +getWallet(userId: String)
+        +topUp(userId: String, amount: BigDecimal)
+        +withdraw(userId: String, amount: BigDecimal)
+        +holdBalance(userId: String, amount: BigDecimal, auctId: String)
+        +releaseBalance(userId: String, amount: BigDecimal, auctId: String)
+        +convertToPayment(userId: String, amount: BigDecimal, auctId: String)
+    }
+
+    class WalletRepository {
+        <<interface>>
+        +findByUserId(userId: String)
+    }
+
+    class WalletTransactionRepository {
+        <<interface>>
+        +existsByAuctId(auctId: String)
+    }
+
+    WalletController --> WalletService : uses
+    InternalWalletController --> WalletService : uses
+    WalletService --> WalletRepository : uses
+    WalletService --> WalletTransactionRepository : uses
+```
+
+#### Code Diagram 2 - Wallet Event Publishing
+
+```
+classDiagram
+
+    class BalanceHeldEvent {
+        -String userId
+        -BigDecimal amount
+        -String auctionId
+    }
+
+    class BalanceReleasedEvent {
+        -String userId
+        -BigDecimal amount
+        -String auctionId
+    }
+
+    class PaymentCompletedEvent {
+        -String userId
+        -BigDecimal amount
+        -String auctionId
+    }
+
+    class TopUpCompletedEvent {
+        -String userId
+        -BigDecimal amount
+    }
+
+    class WalletService {
+        -ApplicationEventPublisher eventPublisher
+    }
+
+    class WalletEventListener {
+        +handleBalanceHeld(event)
+        +handleBalanceReleased(event)
+        +handlePaymentCompleted(event)
+        +handleTopUpCompleted(event)
+    }
+
+    WalletService --> BalanceHeldEvent : publishes
+    WalletService --> BalanceReleasedEvent : publishes
+    WalletService --> PaymentCompletedEvent : publishes
+    WalletService --> TopUpCompletedEvent : publishes
+
+    WalletEventListener --> BalanceHeldEvent : listens
+    WalletEventListener --> BalanceReleasedEvent : listens
+    WalletEventListener --> PaymentCompletedEvent : listens
+    WalletEventListener --> TopUpCompletedEvent : listens
+```
+
+#### Code Diagram 3 - Wallet Domain Entities
+
+```
+classDiagram
+
+    class Wallet {
+        <<Entity>>
+        -String id
+        -String userId
+        -BigDecimal availableBalance
+        -BigDecimal heldBalance
+        -LocalDateTime createdAt
+        -LocalDateTime updatedAt
+    }
+
+    class WalletTransaction {
+        <<Entity>>
+        -String id
+        -String walletId
+        -TransactionType type
+        -BigDecimal amount
+        -String auctId
+        -BigDecimal balanceBefore
+        -BigDecimal balanceAfter
+        -LocalDateTime createdAt
+    }
+
+    class TransactionType {
+        <<enumeration>>
+        TOP_UP
+        WITHDRAW
+        HOLD
+        RELEASE
+        PAYMENT
+    }
+
+    class WalletRepository {
+        <<interface>>
+        +findByUserId(userId: String)
+    }
+
+    class WalletTransactionRepository {
+        <<interface>>
+        +existsByAuctId(auctId: String)
+    }
+
+    WalletRepository --> Wallet : manages
+    WalletTransactionRepository --> WalletTransaction : manages
+
+    WalletTransaction --> TransactionType : uses
+    WalletTransaction --> Wallet : belongs to
+```
