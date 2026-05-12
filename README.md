@@ -1169,3 +1169,218 @@ classDiagram
     CatalogApiClient --> ListingFilterRequest : accepts
     CatalogApiClient --> ListingDetail : returns
 ```
+
+
+### Individual Work Azka (2406435805)
+
+Container yang dikerjakan: **Auth Service** (Spring Boot 4.0.3) — menangani proses otentikasi pengguna, registrasi, manajemen sesi berbasis JWT, fitur keamanan tambahan seperti 2FA (TOTP), dan *rate limiting* untuk mencegah serangan *brute-force*. Service ini merupakan *producer* utama event otentikasi ke RabbitMQ (seperti `user.registered` dan `user.logged.in`) yang akan dikonsumsi oleh service lain di dalam platform.
+
+---
+
+#### Component Diagram — Auth Service
+
+Diagram ini menunjukkan komponen internal di dalam **Auth Service** dan bagaimana mereka saling berkolaborasi untuk memproses request otentikasi, berinteraksi dengan database, dan mengirim event ke message broker.
+
+```mermaid
+C4Component
+    title Component Diagram — Auth Service (Authentication & Security)
+
+    Person(user, "User / Client", "Pengguna yang mencoba mengakses sistem")
+
+    Container_Boundary(auth_api, "Auth Service") {
+        
+        Component(security_config, "SecurityConfig & Filter", "Spring Security", "Konfigurasi filter chain HTTP, interceptor request stateless, dan validasi token via JwtAuthFilter.")
+
+        Component(auth_ctrl, "AuthController", "Spring @RestController\n/api/auth/**", "Endpoint REST untuk register, login, refresh token, password reset, dan manajemen 2FA.")
+        
+        Component(rate_limit, "RateLimitService", "Spring @Service", "Mencegah serangan brute-force dengan membatasi jumlah percobaan login dari IP tertentu.")
+
+        Component(auth_svc, "AuthService", "Spring @Service", "Orkestrator utama logika otentikasi: verifikasi kredensial, registrasi, 2FA verify, dan rotasi token.")
+        
+        Component(jwt_svc, "JwtService", "Spring @Service", "Menghasilkan, memparsing, dan memvalidasi JWT Access Token serta MFA Token (HMAC-SHA).")
+        
+        Component(totp_svc, "TotpService", "Spring @Service", "Integrasi library eksternal untuk generate secret 2FA dan verifikasi kode TOTP 6-digit.")
+        
+        Component(refresh_svc, "RefreshTokenService", "Spring @Service", "Mengelola lifecycle refresh token, rotasi token, dan pencabutan sesi (logout/disable).")
+
+        Component(event_pub, "RabbitMqUserEventPublisher", "Spring @Component", "Mempublikasikan event (user.registered, user.logged.in, dll) ke RabbitMQ.")
+
+        Component(repos, "Repositories", "Spring Data JPA", "UserRepository, VerificationTokenRepository, PasswordResetTokenRepository.")
+    }
+
+    ContainerDb(auth_db, "Auth DB", "PostgreSQL 16", "Tabel: users, verification_tokens, refresh_tokens, dll.")
+    Container(mq, "Message Broker", "CloudAMQP RabbitMQ", "Event-driven broker")
+    Container(gateway, "API Gateway", "Nginx / Kong", "Entry point semua request")
+
+    Rel(user, gateway, "Request otentikasi & manajemen akun", "HTTPS")
+    Rel(gateway, security_config, "Forward request", "REST")
+    Rel(security_config, auth_ctrl, "Teruskan request jika diizinkan", "Method call")
+    
+    Rel(auth_ctrl, rate_limit, "Cek isLoginAllowed(ip)", "Method call")
+    Rel(auth_ctrl, auth_svc, "Delegasi business logic", "Method call")
+    
+    Rel(auth_svc, jwt_svc, "generateToken() / generateMfaToken()", "Method call")
+    Rel(auth_svc, totp_svc, "verifyCode() / generateSecret()", "Method call")
+    Rel(auth_svc, refresh_svc, "create / rotate / revoke token", "Method call")
+    Rel(auth_svc, event_pub, "Publish otentikasi events", "Method call")
+    Rel(auth_svc, repos, "R/W user & token data", "Method call")
+    
+    Rel(repos, auth_db, "SQL", "JDBC/TCP")
+    Rel(event_pub, mq, "Publish ke exchange", "AMQP")
+
+```
+
+---
+
+#### Code Diagram 1 — AuthService (Inti Business Logic)
+
+Diagram ini menunjukkan struktur kelas dari `AuthService` yang menjadi pusat orkestrasi logika otentikasi, dan hubungannya dengan service utilitas lain seperti JWT, TOTP, dan Rate Limiting.
+
+```mermaid
+classDiagram
+    class AuthController {
+        -AuthService authService
+        -RateLimitService rateLimitService
+        +login(req: LoginRequest, httpReq: HttpServletRequest) ResponseEntity~AuthResponse~
+        +register(req: RegisterRequest) ResponseEntity~RegisterResponse~
+        +verifyMfa(req: MfaVerifyRequest, httpReq: HttpServletRequest) ResponseEntity~AuthResponse~
+        +setupTotp(userDetails: UserDetails) ResponseEntity~TotpSetupResponse~
+    }
+
+    class AuthService {
+        -UserRepository userRepository
+        -JwtService jwtService
+        -TotpService totpService
+        -RefreshTokenService refreshTokenService
+        -UserEventPublisher eventPublisher
+        -AuthenticationManager authenticationManager
+        +register(req: RegisterRequest) RegisterResponse
+        +login(req: LoginRequest, deviceInfo: String, ip: String) AuthResponse
+        +verifyMfaAndLogin(mfaToken: String, code: String, deviceInfo: String, ip: String) AuthResponse
+        +setupTotp(email: String) TotpSetupResponse
+        +confirmTotp(email: String, code: String) void
+        +refresh(req: RefreshTokenRequest) AuthResponse
+    }
+
+    class RateLimitService {
+        +isLoginAllowed(ip: String) boolean
+    }
+
+    class JwtService {
+        -String secret
+        -long expiration
+        +generateToken(email: String) String
+        +generateMfaToken(email: String) String
+        +extractEmail(token: String) String
+        +isTokenValid(token: String, userDetails: UserDetails) boolean
+    }
+
+    class TotpService {
+        -SecretGenerator secretGenerator
+        -CodeVerifier codeVerifier
+        +generateSecret() String
+        +getOtpAuthUrl(secret: String, email: String) String
+        +verifyCode(secret: String, code: String) boolean
+    }
+
+    AuthController --> AuthService : uses
+    AuthController --> RateLimitService : uses
+    AuthService --> JwtService : uses
+    AuthService --> TotpService : uses
+
+```
+
+---
+
+#### Code Diagram 2 — Event Publisher & External Integration
+
+Diagram ini memfokuskan pada bagaimana Auth Service menerbitkan *domain events* secara asinkronus ke RabbitMQ menggunakan implementasi `RabbitMqUserEventPublisher`.
+
+```mermaid
+classDiagram
+    class UserEventPublisher {
+        <<interface>>
+        +publishUserRegistered(user: User) void
+        +publishUserLoggedIn(user: User) void
+        +publishPasswordReset(user: User) void
+        +publishUserDisabled(user: User, adminId: UUID) void
+        +publishSessionRevoked(userId: UUID, sessionId: UUID) void
+    }
+
+    class RabbitMqUserEventPublisher {
+        -RabbitTemplate rabbitTemplate
+        +publishUserRegistered(user: User) void
+        +publishUserLoggedIn(user: User) void
+        -publish(routingKey: String, payload: Map) void
+        -buildPayload(userId: UUID, email: String) Map
+    }
+
+    class AuthService {
+        -UserEventPublisher eventPublisher
+    }
+
+    AuthService --> UserEventPublisher : calls
+    UserEventPublisher <|-- RabbitMqUserEventPublisher : implements
+    RabbitMqUserEventPublisher ..> RabbitTemplate : uses
+
+```
+
+---
+
+#### Code Diagram 3 — Domain Entities
+
+Diagram ini memperlihatkan entitas domain yang dikelola oleh Auth Service, termasuk relasi antara pengguna (`User`) dengan berbagai token otentikasi (Verification, Refresh, dan Password Reset).
+
+```mermaid
+classDiagram
+    class User {
+        <<Entity>>
+        -UUID id
+        -String email
+        -String username
+        -String passwordHash
+        -boolean enabled
+        -String role
+        -boolean locked
+        -String totpSecret
+        -boolean totpEnabled
+        -LocalDateTime createdAt
+    }
+
+    class VerificationToken {
+        <<Entity>>
+        -Long id
+        -String token
+        -User user
+        -LocalDateTime expiresAt
+        -boolean used
+    }
+
+    class RefreshToken {
+        <<Entity>>
+        -Long id
+        -String token
+        -User user
+        -LocalDateTime expiresAt
+        -String deviceInfo
+        -String ipAddress
+        -boolean revoked
+    }
+
+    class UserRepository {
+        <<interface>>
+        +findByEmail(email: String) Optional~User~
+        +existsByEmail(email: String) boolean
+    }
+
+    class VerificationTokenRepository {
+        <<interface>>
+        +findByToken(token: String) Optional~VerificationToken~
+    }
+
+    UserRepository --> User : manages
+    VerificationTokenRepository --> VerificationToken : manages
+    VerificationToken --> User : belongs to
+    RefreshToken --> User : belongs to
+
+```
