@@ -349,6 +349,157 @@ Kesepakatan akhir: fokus mitigasi pada **4 risiko skor tertinggi** (skor 6) kare
 
 ## Individual Works
 
-### Individual Work [Nama] ([NPM])
+### Individual Work M Naufal Zhafran Rabiul Batara (2406361694)
 
-*[Menambahkan **Component Diagram** dan **Code Diagram** dari container yang dikerjakan.]*
+Container yang dikerjakan: **Booking Service** (Spring Boot 3.5.x) — menangani pembuatan pesanan (*order*) dari hasil lelang, manajemen notifikasi in-app secara real-time, dan pengiriman (*shipment*). Service ini adalah *consumer* utama event dari RabbitMQ (WinnerDetermined, BidPlaced, BalanceConverted, BalanceReleased) dan menggunakan SSE (*Server-Sent Events*) untuk push notifikasi ke browser secara real-time.
+
+#### Component Diagram — Booking Service
+
+```mermaid
+C4Component
+    title Component Diagram — Booking Service (Order & Notification)
+
+    Person(user, "Buyer / Seller", "Pengguna platform")
+
+    Container_Boundary(booking_api, "Booking Service") {
+        Component(booking_ctrl, "BookingController", "Spring @RestController\n/api/bookings/**", "Endpoint REST untuk melihat pesanan, update status shipment, dan konfirmasi penerimaan barang")
+        Component(notif_ctrl, "NotificationController", "Spring @RestController\n/api/notifications/**", "Endpoint REST untuk melihat notifikasi, subscribe SSE stream, dan kelola preferensi notifikasi")
+
+        Component(booking_svc, "BookingService", "Spring @Service", "Membuat booking dari event lelang, transisi status booking, update shipment, dan konfirmasi delivery")
+        Component(notif_svc, "NotificationService", "Spring @Service", "Membuat notifikasi WIN/LOSE/NEW_BID/OUTBID/PAYMENT, cek preferensi user, simpan dan push notifikasi")
+        Component(realtime_svc, "RealtimeEventService", "Spring @Service (SSE)", "Mengelola SSE emitter per user; push notification, booking status change, dan auction update ke browser secara real-time")
+        Component(audit_svc, "BookingStatusAuditLogService", "Spring @Service", "Mencatat setiap transisi status booking ke audit log")
+        Component(reliable_proc, "ReliableEventProcessor", "Spring @Component", "Memastikan idempotency: cek ProcessedEvent sebelum eksekusi handler, tangani dead-letter jika gagal")
+
+        Component(event_consumer, "BookingEventConsumer", "Spring @Component\n(manual dispatch)", "Menerima dan memvalidasi event dari RabbitMQ: WinnerDetermined, AuctionClosed, BidPlaced, BalanceConverted, BalanceReleased")
+
+        Component(booking_repo, "BookingRepository", "Spring Data JPA", "R/W data Booking & BookingItem ke DB")
+        Component(notif_repo, "NotificationRepository", "Spring Data JPA", "R/W data Notification & NotificationPreference ke DB")
+        Component(processed_repo, "ProcessedEventRepository", "Spring Data JPA", "R/W ProcessedEvent untuk deduplication event")
+    }
+
+    ContainerDb(booking_db, "Booking DB", "PostgreSQL 16", "Tabel: bookings, booking_items, shipments, notifications, notification_preferences, booking_status_audit_logs, processed_events")
+    Container(mq, "Message Broker", "CloudAMQP RabbitMQ", "Event-driven broker")
+    Container(gateway, "API Gateway", "Nginx / Kong", "Entry point semua request")
+
+    Rel(user, gateway, "Request booking & notifikasi", "HTTPS")
+    Rel(gateway, booking_ctrl, "Route /api/bookings/**", "REST/JSON")
+    Rel(gateway, notif_ctrl, "Route /api/notifications/**", "REST/JSON + SSE")
+
+    Rel(booking_ctrl, booking_svc, "Delegasi business logic", "Method call")
+    Rel(notif_ctrl, notif_svc, "Delegasi business logic", "Method call")
+    Rel(notif_ctrl, realtime_svc, "subscribe(userId) → SseEmitter", "Method call")
+
+    Rel(booking_svc, notif_svc, "Trigger win/lose/payment notifications", "Method call")
+    Rel(booking_svc, audit_svc, "recordStatusChange()", "Method call")
+    Rel(booking_svc, realtime_svc, "publishBookingStatusChange()", "Method call")
+    Rel(notif_svc, realtime_svc, "publishNotification()", "Method call")
+
+    Rel(mq, event_consumer, "Deliver events (WinnerDetermined, BidPlaced, dll.)", "AMQP")
+    Rel(event_consumer, reliable_proc, "process(event, type, handler)", "Method call")
+    Rel(reliable_proc, processed_repo, "hasProcessed() / markProcessed()", "JPA")
+    Rel(reliable_proc, booking_svc, "createBookingFromWinnerEvent()", "Method call")
+    Rel(reliable_proc, notif_svc, "createWinLoseNotifications() / createBidPlacedNotifications()", "Method call")
+
+    Rel(booking_svc, booking_repo, "R/W booking data", "JPA")
+    Rel(notif_svc, notif_repo, "R/W notification data", "JPA")
+    Rel(booking_repo, booking_db, "SQL", "JDBC/TCP")
+    Rel(notif_repo, booking_db, "SQL", "JDBC/TCP")
+    Rel(processed_repo, booking_db, "SQL", "JDBC/TCP")
+```
+
+#### Code Diagram — NotificationService
+
+Diagram ini menunjukkan struktur kelas internal komponen **NotificationService** beserta kelas-kelas yang berkolaborasi langsung dengannya.
+
+```mermaid
+classDiagram
+    class NotificationController {
+        -NotificationService notificationService
+        -RealtimeEventService realtimeEventService
+        +getMyNotifications(userId: String) List~NotificationResponse~
+        +streamMyRealtimeEvents(userId: String) SseEmitter
+        +getMyNotificationPreference(userId: String) NotificationPreferenceResponse
+        +updateMyNotificationPreference(userId: String, request: UpdateNotificationPreferenceRequest) NotificationPreferenceResponse
+        +markNotificationAsRead(id: Long, userId: String, request: MarkNotificationReadRequest) NotificationResponse
+    }
+
+    class NotificationService {
+        -NotificationRepository notificationRepository
+        -NotificationPreferenceRepository notificationPreferenceRepository
+        -RealtimeEventService realtimeEventService
+        +getMyNotifications(userId: String) List~Notification~
+        +getMyNotificationPreference(userId: String) NotificationPreference
+        +upsertNotificationPreference(userId: String, emailEnabled: Boolean, inAppEnabled: Boolean) NotificationPreference
+        +markNotificationAsRead(id: Long, userId: String) Notification
+        +createWinLoseNotifications(winnerUserId: String, loserUserIds: List, auctionId: String, finalPrice: Long) void
+        +createBidPlacedNotifications(sellerUserId: String, bidderUserId: String, prevBidderUserId: String, auctionId: String, bidAmount: Long, itemName: String) void
+        +createBalanceConvertedNotification(userId: String, auctionId: String, amount: Long) void
+        +createBalanceReleasedNotification(userId: String, auctionId: String, amount: Long) void
+        -addIfInAppEnabled(notifications: List, userId: String, type: NotificationType, title: String, message: String, auctionId: String) void
+        -isInAppEnabled(userId: String) boolean
+        -saveNotifications(notifications: List~Notification~) void
+    }
+
+    class RealtimeEventService {
+        -emittersByUserId: Map~String, List~SseEmitter~~
+        +subscribe(userId: String) SseEmitter
+        +publishNotification(notification: Notification) void
+        +publishAuctionUpdate(userId: String, update: RealtimeAuctionUpdateResponse) void
+        +publishBookingStatusChange(booking: Booking, fromStatus: BookingStatus, toStatus: BookingStatus, ...) void
+        -send(userId: String, eventName: String, data: Object) void
+        -removeEmitter(userId: String, emitter: SseEmitter) void
+    }
+
+    class NotificationRepository {
+        <<interface>>
+        +findByUserIdOrderByCreatedAtDesc(userId: String) List~Notification~
+        +findByIdAndUserId(id: Long, userId: String) Optional~Notification~
+    }
+
+    class NotificationPreferenceRepository {
+        <<interface>>
+        +findByUserId(userId: String) Optional~NotificationPreference~
+    }
+
+    class Notification {
+        -Long id
+        -String userId
+        -NotificationType type
+        -String title
+        -String message
+        -Boolean isRead
+        -OffsetDateTime readAt
+        -String relatedAuctionId
+        -Booking relatedBooking
+        -OffsetDateTime createdAt
+        -OffsetDateTime updatedAt
+    }
+
+    class NotificationPreference {
+        -Long id
+        -String userId
+        -Boolean emailEnabled
+        -Boolean inAppEnabled
+    }
+
+    class NotificationType {
+        <<enumeration>>
+        WIN
+        LOSE
+        NEW_BID
+        OUTBID
+        PAYMENT_CONFIRMED
+        BALANCE_RELEASED
+        INFO
+    }
+
+    NotificationController --> NotificationService : uses
+    NotificationController --> RealtimeEventService : subscribe()
+    NotificationService --> NotificationRepository : findBy / save
+    NotificationService --> NotificationPreferenceRepository : findByUserId / save
+    NotificationService --> RealtimeEventService : publishNotification()
+    NotificationRepository --> Notification : manages
+    NotificationPreferenceRepository --> NotificationPreference : manages
+    Notification --> NotificationType : type
+```
