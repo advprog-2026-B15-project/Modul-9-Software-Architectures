@@ -778,3 +778,394 @@ classDiagram
     AuctionPage --> AuctionModule : calls
     AuctionModule --> ApiConfig : depends on
 ```
+
+### Individual Work Sean Marcello Maheron (2406401792)
+
+Container yang dikerjakan: **Catalog Service** (Spring Boot 3.5.11) — menangani seluruh siklus hidup *listing* barang yang akan dilelang, mulai dari pembuatan dan moderasi listing oleh Admin, pengelolaan kategori, hingga sinkronisasi harga saat lelang berlangsung. Service ini adalah *consumer* event `BidPlaced` dan `AuctionClosed` dari RabbitMQ untuk menjaga data harga listing tetap sinkron, dan menyediakan API bagi frontend untuk browsing katalog serta bagi Auction Service untuk validasi listing.
+
+---
+
+#### Component Diagram — Catalog Service
+
+Diagram ini menunjukkan komponen-komponen internal di dalam **Catalog Service** beserta cara mereka berkolaborasi untuk melayani request REST dari frontend/gateway dan memproses event dari message broker.
+
+```mermaid
+C4Component
+    title Component Diagram — Catalog Service
+
+    Person(seller, "Seller", "Penjual barang")
+    Person(buyer, "Buyer", "Pencari barang")
+    Person(admin, "Admin", "Moderator listing")
+
+    Container_Boundary(catalog_api, "Catalog Service") {
+
+        Component(listing_ctrl, "ListingController", "Spring @RestController\n/api/listings/**", "Endpoint REST untuk CRUD listing: seller membuat listing, admin moderasi (approve/reject), buyer browsing & search.")
+
+        Component(category_ctrl, "CategoryController", "Spring @RestController\n/api/categories/**", "Endpoint REST untuk pengelolaan kategori barang (hanya Admin).")
+
+        Component(internal_ctrl, "CatalogInternalController", "Spring @RestController\n/internal/catalog/**", "Endpoint internal (non-publik) untuk Auction Service: validasi listing aktif sebelum membuka lelang.")
+
+        Component(listing_svc, "ListingService", "Spring @Service", "Business logic inti: membuat listing baru, mengubah status (DRAFT→PENDING→ACTIVE→SOLD), sinkronisasi current_price dari event lelang, dan query pencarian.")
+
+        Component(category_svc, "CategoryService", "Spring @Service", "Mengelola hierarki kategori (parent-child), validasi kategori aktif, dan cascade update.")
+
+        Component(image_svc, "ListingImageService", "Spring @Service", "Mengelola upload, penyimpanan, dan penghapusan gambar listing ke object storage.")
+
+        Component(search_svc, "ListingSearchService", "Spring @Service", "Membangun query pencarian dinamis berdasarkan filter (keyword, kategori, harga, status) menggunakan JPA Specification.")
+
+        Component(event_consumer, "CatalogEventConsumer", "Spring @Component\n(RabbitMQ Listener)", "Menerima event BidPlaced dan AuctionClosed dari broker, mendelegasikan ke ReliableEventProcessor untuk pemrosesan idempoten.")
+
+        Component(reliable_proc, "ReliableEventProcessor", "Spring @Component", "Guard idempotency: memeriksa ProcessedEvent sebelum menjalankan handler. Jika event sudah diproses, pesan di-ACK dan dilewati.")
+
+        Component(listing_repo, "ListingRepository", "Spring Data JPA", "R/W entitas Listing & ListingImage ke Catalog DB.")
+        Component(category_repo, "CategoryRepository", "Spring Data JPA", "R/W entitas Category ke Catalog DB.")
+        Component(processed_repo, "ProcessedEventRepository", "Spring Data JPA", "R/W tabel processed_events untuk deduplication event dari broker.")
+    }
+
+    ContainerDb(catalog_db, "Catalog DB", "PostgreSQL 15", "Tabel: listings, listing_images, categories, processed_events")
+    Container(mq, "Message Broker", "CloudAMQP RabbitMQ", "Event-driven broker")
+    Container(gateway, "API Gateway", "Nginx / Kong", "Single entry point semua request publik")
+    Container(auction_api, "Auction Service", "Spring Boot", "Memanggil /internal/catalog untuk validasi listing")
+    Container(storage, "Object Storage", "AWS S3 / Cloudflare R2", "Menyimpan gambar listing")
+
+    %% User → Gateway → Controller
+    Rel(seller, gateway, "Buat & kelola listing", "HTTPS")
+    Rel(buyer, gateway, "Browse & search listing", "HTTPS")
+    Rel(admin, gateway, "Moderasi & kelola kategori", "HTTPS")
+    Rel(gateway, listing_ctrl, "Route /api/listings/**", "REST/JSON")
+    Rel(gateway, category_ctrl, "Route /api/categories/**", "REST/JSON")
+
+    %% Internal call dari Auction Service (bypass gateway)
+    Rel(auction_api, internal_ctrl, "GET /internal/catalog/listings/{id}/validate", "REST/JSON")
+
+    %% Controller → Service
+    Rel(listing_ctrl, listing_svc, "Delegasi business logic", "Method call")
+    Rel(listing_ctrl, search_svc, "Delegasi query pencarian", "Method call")
+    Rel(listing_ctrl, image_svc, "Upload / hapus gambar", "Method call")
+    Rel(category_ctrl, category_svc, "Delegasi business logic", "Method call")
+    Rel(internal_ctrl, listing_svc, "validateListingForAuction(id)", "Method call")
+
+    %% Event Consumer
+    Rel(mq, event_consumer, "Deliver BidPlaced & AuctionClosed", "AMQP")
+    Rel(event_consumer, reliable_proc, "process(event, type, handler)", "Method call")
+    Rel(reliable_proc, processed_repo, "hasProcessed() / markProcessed()", "JPA")
+    Rel(reliable_proc, listing_svc, "syncCurrentPrice() / markAsSold()", "Method call")
+
+    %% Service → Repository → DB
+    Rel(listing_svc, listing_repo, "R/W data listing", "JPA")
+    Rel(category_svc, category_repo, "R/W data kategori", "JPA")
+    Rel(image_svc, listing_repo, "R/W ListingImage", "JPA")
+    Rel(image_svc, storage, "Upload / delete object", "HTTPS / SDK")
+    Rel(listing_repo, catalog_db, "SQL", "JDBC/TCP")
+    Rel(category_repo, catalog_db, "SQL", "JDBC/TCP")
+    Rel(processed_repo, catalog_db, "SQL", "JDBC/TCP")
+```
+
+---
+
+#### Code Diagram 1 — ListingService (Inti Business Logic)
+
+Diagram ini menunjukkan struktur kelas **ListingService** beserta semua dependensi dan kelas kolaboratornya. `ListingService` adalah pusat logika bisnis untuk siklus hidup listing dan sinkronisasi harga dari event lelang.
+
+```mermaid
+classDiagram
+    class ListingController {
+        -ListingService listingService
+        -ListingSearchService searchService
+        -ListingImageService imageService
+        +createListing(req: CreateListingRequest, sellerId: String) ListingResponse
+        +getListingById(id: String) ListingResponse
+        +searchListings(filter: ListingFilterRequest, pageable: Pageable) Page~ListingResponse~
+        +updateListing(id: String, req: UpdateListingRequest, sellerId: String) ListingResponse
+        +approveListing(id: String) ListingResponse
+        +rejectListing(id: String, reason: String) ListingResponse
+        +deleteListing(id: String, sellerId: String) void
+    }
+
+    class ListingService {
+        -ListingRepository listingRepository
+        -CategoryRepository categoryRepository
+        -ListingMapper listingMapper
+        +createListing(req: CreateListingRequest, sellerId: String) Listing
+        +getListingById(id: String) Listing
+        +updateListing(id: String, req: UpdateListingRequest, sellerId: String) Listing
+        +approveListing(id: String) Listing
+        +rejectListing(id: String, reason: String) Listing
+        +deleteListing(id: String, sellerId: String) void
+        +validateListingForAuction(listingId: String) ListingValidationResult
+        +syncCurrentPrice(listingId: String, newPrice: Long) void
+        +markAsSold(listingId: String, finalPrice: Long) void
+        -assertOwnership(listing: Listing, sellerId: String) void
+        -assertStatusTransitionAllowed(from: ListingStatus, to: ListingStatus) void
+    }
+
+    class ListingSearchService {
+        -ListingRepository listingRepository
+        +search(filter: ListingFilterRequest, pageable: Pageable) Page~Listing~
+        -buildSpecification(filter: ListingFilterRequest) Specification~Listing~
+    }
+
+    class ListingMapper {
+        +toResponse(listing: Listing) ListingResponse
+        +toEntity(req: CreateListingRequest) Listing
+    }
+
+    class ListingRepository {
+        <<interface>>
+        +findByIdAndSellerId(id: String, sellerId: String) Optional~Listing~
+        +findAll(spec: Specification~Listing~, pageable: Pageable) Page~Listing~
+        +existsByIdAndStatus(id: String, status: ListingStatus) boolean
+    }
+
+    class CategoryRepository {
+        <<interface>>
+        +findByIdAndActiveTrue(id: String) Optional~Category~
+    }
+
+    class ListingValidationResult {
+        -boolean valid
+        -String reason
+        -Long startingPrice
+        +isValid() boolean
+        +static ok(startingPrice: Long) ListingValidationResult
+        +static fail(reason: String) ListingValidationResult
+    }
+
+    ListingController --> ListingService : uses
+    ListingController --> ListingSearchService : uses
+    ListingService --> ListingRepository : R/W
+    ListingService --> CategoryRepository : validates category
+    ListingService --> ListingMapper : transforms
+    ListingService --> ListingValidationResult : returns
+    ListingSearchService --> ListingRepository : queries
+```
+
+---
+
+#### Code Diagram 2 — Domain Entities
+
+Diagram ini menunjukkan seluruh entitas domain dalam Catalog Service beserta relasi dan enumerasi status yang mengatur siklus hidup sebuah listing.
+
+```mermaid
+classDiagram
+    class Listing {
+        -String id
+        -String sellerId
+        -String title
+        -String description
+        -Long startingPrice
+        -Long currentPrice
+        -ListingStatus status
+        -String rejectionReason
+        -Category category
+        -List~ListingImage~ images
+        -OffsetDateTime createdAt
+        -OffsetDateTime updatedAt
+        +prePersist() void
+        +preUpdate() void
+    }
+
+    class ListingImage {
+        -Long id
+        -Listing listing
+        -String imageUrl
+        -String storageKey
+        -Boolean isPrimary
+        -OffsetDateTime uploadedAt
+    }
+
+    class Category {
+        -String id
+        -String name
+        -String slug
+        -Category parent
+        -List~Category~ children
+        -Boolean active
+        -OffsetDateTime createdAt
+        +prePersist() void
+    }
+
+    class ProcessedEvent {
+        -String eventId
+        -String eventType
+        -OffsetDateTime processedAt
+    }
+
+    class ListingStatus {
+        <<enumeration>>
+        DRAFT
+        PENDING_REVIEW
+        ACTIVE
+        REJECTED
+        SOLD
+        ARCHIVED
+    }
+
+    Listing --> ListingStatus : status
+    Listing --> Category : belongs to
+    Listing "1" --> "*" ListingImage : has
+    Category --> Category : parent (self-ref)
+```
+
+---
+
+#### Code Diagram 3 — Idempotent Event Consumer (BidPlaced & AuctionClosed)
+
+Diagram ini menunjukkan alur pemrosesan event dari RabbitMQ di dalam Catalog Service. Pola **ReliableEventProcessor** memastikan bahwa setiap event hanya diproses tepat satu kali meskipun broker mengirim ulang pesan yang sama (*at-least-once delivery*).
+
+```mermaid
+classDiagram
+    class CatalogEventConsumer {
+        -ReliableEventProcessor reliableEventProcessor
+        +onBidPlaced(payload: Map~String,Object~) void
+        +onAuctionClosed(payload: Map~String,Object~) void
+        -parseBidPlacedEvent(payload: Map~String,Object~) BidPlacedEvent
+        -parseAuctionClosedEvent(payload: Map~String,Object~) AuctionClosedEvent
+    }
+
+    class ReliableEventProcessor {
+        -ProcessedEventRepository processedEventRepository
+        +process(eventId: String, eventType: String, handler: Runnable) void
+        -hasBeenProcessed(eventId: String) boolean
+        -markAsProcessed(eventId: String, eventType: String) void
+    }
+
+    class ProcessedEventRepository {
+        <<interface>>
+        +existsByEventId(eventId: String) boolean
+        +save(event: ProcessedEvent) ProcessedEvent
+    }
+
+    class ListingService {
+        +syncCurrentPrice(listingId: String, newPrice: Long) void
+        +markAsSold(listingId: String, finalPrice: Long) void
+    }
+
+    class BidPlacedEvent {
+        -String eventId
+        -String eventType
+        -String auctionId
+        -String listingId
+        -String bidderId
+        -Long amount
+        -OffsetDateTime occurredAt
+    }
+
+    class AuctionClosedEvent {
+        -String eventId
+        -String eventType
+        -String auctionId
+        -String listingId
+        -String winningBidderId
+        -Long finalPrice
+        -OffsetDateTime occurredAt
+    }
+
+    note for ReliableEventProcessor "Algorithm:\n1. Check processed_events table\n2. If found → skip (duplicate)\n3. If not found → run handler\n4. Insert to processed_events\n5. Commit"
+
+    CatalogEventConsumer --> ReliableEventProcessor : delegates to
+    CatalogEventConsumer --> BidPlacedEvent : parses
+    CatalogEventConsumer --> AuctionClosedEvent : parses
+    ReliableEventProcessor --> ProcessedEventRepository : checks & marks
+    ReliableEventProcessor --> ListingService : calls syncCurrentPrice()
+    ReliableEventProcessor --> ListingService : calls markAsSold()
+```
+
+---
+
+#### Code Diagram 4 — Catalog Module (Frontend — Next.js)
+
+Diagram ini menunjukkan struktur modul **Catalog** pada sisi frontend. Modul ini bertanggung jawab atas semua interaksi UI yang berkaitan dengan browsing katalog, detail listing, pencarian & filter, serta pengelolaan listing oleh Seller.
+
+```mermaid
+classDiagram
+    class CatalogPage {
+        <<Next.js Page — /catalog>>
+        -ListingFilterState filterState
+        -Page~ListingCard~ listingPage
+        +render() JSX.Element
+        +handleFilterChange(filter: ListingFilterRequest) void
+        +handlePageChange(page: number) void
+    }
+
+    class ListingDetailPage {
+        <<Next.js Page — /catalog/[id]>>
+        -ListingDetail listing
+        -boolean isOwner
+        +render() JSX.Element
+        +handleEditRedirect() void
+    }
+
+    class SellerListingPage {
+        <<Next.js Page — /seller/listings>>
+        -ListingDetail[] myListings
+        +render() JSX.Element
+        +handleCreateNew() void
+        +handleDelete(id: String) void
+    }
+
+    class ListingCard {
+        <<React Component>>
+        -ListingCardProps props
+        +render() JSX.Element
+    }
+
+    class ListingFilterPanel {
+        <<React Component>>
+        -CategoryOption[] categories
+        -ListingFilterState state
+        +onFilterChange: Function
+        +render() JSX.Element
+    }
+
+    class CreateListingForm {
+        <<React Component>>
+        -CategoryOption[] categories
+        -FormState state
+        +handleSubmit() void
+        +handleImageUpload(files: File[]) void
+        +render() JSX.Element
+    }
+
+    class CatalogApiClient {
+        <<Service>>
+        -String BASE_URL
+        +getListings(filter: ListingFilterRequest, page: number, size: number) Promise~PageResponse~ListingCard~~
+        +getListingById(id: String) Promise~ListingDetail~
+        +createListing(req: CreateListingRequest) Promise~ListingDetail~
+        +updateListing(id: String, req: UpdateListingRequest) Promise~ListingDetail~
+        +deleteListing(id: String) Promise~void~
+        +getCategories() Promise~CategoryOption[]~
+        +uploadImages(listingId: String, files: File[]) Promise~void~
+    }
+
+    class ListingFilterRequest {
+        +String keyword
+        +String categoryId
+        +Long minPrice
+        +Long maxPrice
+        +ListingStatus status
+    }
+
+    class ListingDetail {
+        +String id
+        +String title
+        +String description
+        +Long startingPrice
+        +Long currentPrice
+        +ListingStatus status
+        +CategoryOption category
+        +String[] imageUrls
+        +String sellerId
+    }
+
+    CatalogPage --> ListingCard : renders many
+    CatalogPage --> ListingFilterPanel : uses
+    CatalogPage --> CatalogApiClient : calls getListings()
+    ListingDetailPage --> CatalogApiClient : calls getListingById()
+    SellerListingPage --> CatalogApiClient : calls createListing() / deleteListing()
+    SellerListingPage --> CreateListingForm : renders
+    CreateListingForm --> CatalogApiClient : calls createListing() / uploadImages()
+    CatalogApiClient --> ListingFilterRequest : accepts
+    CatalogApiClient --> ListingDetail : returns
+```
