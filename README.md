@@ -1171,27 +1171,28 @@ classDiagram
 ```
 
 
+```markdown
 ### Individual Work Azka (2406435805)
 
-Container yang dikerjakan: **Auth Service** (Spring Boot 4.0.3) — menangani proses otentikasi pengguna, registrasi, manajemen sesi berbasis JWT, fitur keamanan tambahan seperti 2FA (TOTP), dan *rate limiting* untuk mencegah serangan *brute-force*. Service ini merupakan *producer* utama event otentikasi ke RabbitMQ (seperti `user.registered` dan `user.logged.in`) yang akan dikonsumsi oleh service lain di dalam platform.
+Container yang dikerjakan: **Auth Service** (Spring Boot 4.0.3) - menangani proses otentikasi pengguna, registrasi, manajemen sesi berbasis JWT, fitur keamanan tambahan seperti 2FA (TOTP), dan *rate limiting* untuk mencegah serangan *brute-force*. Service ini merupakan *producer* utama event otentikasi ke RabbitMQ (seperti `user.registered` dan `user.logged.in`) yang akan dikonsumsi oleh service lain di dalam platform.
 
 ---
 
-#### Component Diagram — Auth Service
+#### Component Diagram - Auth Service
 
 Diagram ini menunjukkan komponen internal di dalam **Auth Service** dan bagaimana mereka saling berkolaborasi untuk memproses request otentikasi, berinteraksi dengan database, dan mengirim event ke message broker.
 
 ```mermaid
 C4Component
-    title Component Diagram — Auth Service (Authentication & Security)
+    title Component Diagram - Auth Service (Authentication and Security)
 
     Person(user, "User / Client", "Pengguna yang mencoba mengakses sistem")
 
     Container_Boundary(auth_api, "Auth Service") {
         
-        Component(security_config, "SecurityConfig & Filter", "Spring Security", "Konfigurasi filter chain HTTP, interceptor request stateless, dan validasi token via JwtAuthFilter.")
+        Component(security_config, "SecurityConfig and Filter", "Spring Security", "Konfigurasi filter chain HTTP, interceptor request stateless, dan validasi token via JwtAuthFilter.")
 
-        Component(auth_ctrl, "AuthController", "Spring @RestController\n/api/auth/**", "Endpoint REST untuk register, login, refresh token, password reset, dan manajemen 2FA.")
+        Component(auth_ctrl, "AuthController", "Spring @RestController (/api/auth/**)", "Endpoint REST untuk register, login, refresh token, password reset, dan manajemen 2FA.")
         
         Component(rate_limit, "RateLimitService", "Spring @Service", "Mencegah serangan brute-force dengan membatasi jumlah percobaan login dari IP tertentu.")
 
@@ -1212,7 +1213,7 @@ C4Component
     Container(mq, "Message Broker", "CloudAMQP RabbitMQ", "Event-driven broker")
     Container(gateway, "API Gateway", "Nginx / Kong", "Entry point semua request")
 
-    Rel(user, gateway, "Request otentikasi & manajemen akun", "HTTPS")
+    Rel(user, gateway, "Request otentikasi dan manajemen akun", "HTTPS")
     Rel(gateway, security_config, "Forward request", "REST")
     Rel(security_config, auth_ctrl, "Teruskan request jika diizinkan", "Method call")
     
@@ -1223,7 +1224,7 @@ C4Component
     Rel(auth_svc, totp_svc, "verifyCode() / generateSecret()", "Method call")
     Rel(auth_svc, refresh_svc, "create / rotate / revoke token", "Method call")
     Rel(auth_svc, event_pub, "Publish otentikasi events", "Method call")
-    Rel(auth_svc, repos, "R/W user & token data", "Method call")
+    Rel(auth_svc, repos, "R/W user dan token data", "Method call")
     
     Rel(repos, auth_db, "SQL", "JDBC/TCP")
     Rel(event_pub, mq, "Publish ke exchange", "AMQP")
@@ -1232,7 +1233,7 @@ C4Component
 
 ---
 
-#### Code Diagram 1 — AuthService (Inti Business Logic)
+#### Code Diagram 1 - AuthService (Inti Business Logic)
 
 Diagram ini menunjukkan struktur kelas dari `AuthService` yang menjadi pusat orkestrasi logika otentikasi, dan hubungannya dengan service utilitas lain seperti JWT, TOTP, dan Rate Limiting.
 
@@ -1292,7 +1293,7 @@ classDiagram
 
 ---
 
-#### Code Diagram 2 — Event Publisher & External Integration
+#### Code Diagram 2 - Event Publisher and External Integration
 
 Diagram ini memfokuskan pada bagaimana Auth Service menerbitkan *domain events* secara asinkronus ke RabbitMQ menggunakan implementasi `RabbitMqUserEventPublisher`.
 
@@ -1327,7 +1328,7 @@ classDiagram
 
 ---
 
-#### Code Diagram 3 — Domain Entities
+#### Code Diagram 3 - Domain Entities
 
 Diagram ini memperlihatkan entitas domain yang dikelola oleh Auth Service, termasuk relasi antara pengguna (`User`) dengan berbagai token otentikasi (Verification, Refresh, dan Password Reset).
 
@@ -1382,5 +1383,9 @@ classDiagram
     VerificationTokenRepository --> VerificationToken : manages
     VerificationToken --> User : belongs to
     RefreshToken --> User : belongs to
+
+```
+
+```
 
 ```
