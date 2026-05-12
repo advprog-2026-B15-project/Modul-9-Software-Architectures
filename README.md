@@ -1171,7 +1171,7 @@ classDiagram
 ```
 
 
-```markdown
+
 ### Individual Work Azka (2406435805)
 
 Container yang dikerjakan: **Auth Service** (Spring Boot 4.0.3) - menangani proses otentikasi pengguna, registrasi, manajemen sesi berbasis JWT, fitur keamanan tambahan seperti 2FA (TOTP), dan *rate limiting* untuk mencegah serangan *brute-force*. Service ini merupakan *producer* utama event otentikasi ke RabbitMQ (seperti `user.registered` dan `user.logged.in`) yang akan dikonsumsi oleh service lain di dalam platform.
