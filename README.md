@@ -267,25 +267,85 @@ C4Container
 
 ## Risk Storming Explanation
 
+*Risk storming* dilakukan dengan cara masing-masing anggota tim mereview diagram arsitektur *current* secara mandiri, memberi label risiko pada setiap area, lalu mendiskusikan hasilnya bersama untuk mencapai konsensus. Diagram berikut menunjukkan area-area yang diidentifikasi berisiko beserta level risikonya (🔴 Tinggi, 🟠 Sedang, 🟢 Rendah).
+
+```mermaid
+graph TB
+    classDef high fill:#f28b82,stroke:#c62828,color:#000
+    classDef medium fill:#ffb74d,stroke:#e65100,color:#000
+    classDef low fill:#81c995,stroke:#2e7d32,color:#000
+    classDef normal fill:#aecbfa,stroke:#1a73e8,color:#000
+
+    Browser["Web Browser"]
+
+    subgraph VERCEL["Vercel"]
+        FRONTEND["Web App\n(Next.js)"]:::normal
+    end
+
+    subgraph ENTRY["Entry Point"]
+        NO_GW["⚠️ Tidak ada API Gateway\nFrontend → 5 service langsung"]:::high
+    end
+
+    subgraph AWS["AWS EC2 (per service)"]
+        AUTH["Auth Service\n(:8081)"]:::low
+        CATALOG["Catalog Service\n(:8080)"]:::medium
+        AUCTION["Auction Service\n(:8083)"]:::high
+        WALLET["Wallet Service\n(:8080)"]:::medium
+        BOOKING["Booking Service\n(:8085)"]:::low
+    end
+
+    subgraph MANAGED["Managed Cloud"]
+        AUCTION_DB["Neon DB\n(cold start risk)"]:::low
+        REDIS["Upstash Redis"]:::low
+        MQ["CloudAMQP\n(single broker)"]:::medium
+    end
+
+    subgraph OBSERVABILITY["Observabilitas"]
+        NO_MON["⚠️ Tidak ada monitoring\nterpusat"]:::high
+    end
+
+    Browser --> FRONTEND
+    FRONTEND --> NO_GW
+    NO_GW -.->|"5 direct calls"| AUTH & CATALOG & AUCTION & WALLET & BOOKING
+    AUCTION -.->|"🔴 sync REST\n(cascade risk)"| WALLET
+    AUCTION -.->|"🔴 sync REST\n(cascade risk)"| CATALOG
+    AUCTION -.-> AUCTION_DB & REDIS
+    AUTH & AUCTION & WALLET -.->|"AMQP"| MQ
+    MQ -.-> CATALOG & BOOKING
+```
+
 ### 1. Identification
 
-*[Jelaskan risiko apa saja yang diidentifikasi tiap anggota secara individual, area mana saja yang dinilai berisiko, dan skor risiko masing-masing menggunakan Risk Matrix (Impact × Likelihood = Score).]*
+Tiap anggota tim mereview diagram *current* secara mandiri dan menandai area yang dianggap berisiko. Berikut hasil identifikasi yang digabungkan:
 
 | Area Risiko | Deskripsi Risiko | Impact (1-3) | Likelihood (1-3) | Skor | Level |
 |---|---|---|---|---|---|
-| *[Tambahkan temuan masing-masing anggota]* | | | | | |
+| Frontend → 5 service langsung (tanpa API Gateway) | Tidak ada rate limiting atau auth centralization; jika IP salah satu service berubah, frontend wajib diubah | 2 | 3 | 6 | 🔴 Tinggi |
+| Auction → Wallet REST sinkron | Jika Wallet down atau lambat, proses bid gagal/timeout; tidak ada fallback | 3 | 2 | 6 | 🔴 Tinggi |
+| Auction → Catalog REST sinkron | Jika Catalog down saat validasi listing, Auction tidak bisa memproses bid apapun | 3 | 2 | 6 | 🔴 Tinggi |
+| Tidak ada monitoring terpusat | Error/degradasi hanya diketahui setelah user komplain; waktu deteksi & penanganan (MTTR) tinggi | 2 | 3 | 6 | 🔴 Tinggi |
+| Single EC2 per service (tanpa HA) | Jika satu EC2 down (hardware failure, patching), service tersebut mati total | 3 | 1 | 3 | 🟠 Sedang |
+| CloudAMQP sebagai single message broker | Jika CloudAMQP mengalami outage, semua alur event (auth, auction, wallet, booking) berhenti | 2 | 2 | 4 | 🟠 Sedang |
+| Neon DB Serverless untuk Auction | Cold start Neon DB menambah latensi pada query pertama setelah periode idle | 1 | 2 | 2 | 🟢 Rendah |
 
 ### 2. Consensus
 
-*[Jelaskan bagaimana proses diskusi berjalan, perbedaan pendapat yang muncul antar anggota, dan bagaimana tim mencapai kesepakatan akhir mengenai level risiko tiap area.]*
+Setelah identifikasi individual, tim berdiskusi untuk menyelaraskan skor dan menentukan prioritas. Beberapa perbedaan pendapat yang muncul:
+
+- **"Frontend → 5 service langsung"** — ada anggota yang menilai *Likelihood* = 2 karena URL service jarang berubah di production. Setelah diskusi, disepakati *Likelihood* = 3 karena tanpa API Gateway tidak ada rate limiting sehingga endpoint service terbuka langsung ke internet, dan dalam skenario scaling atau re-deploy region, IP EC2 bisa berganti.
+- **"Single EC2 per service"** — sebagian anggota menilai *Likelihood* = 2. Setelah mempertimbangkan SLA AWS EC2 yang tinggi dan kemampuan restart cepat, disepakati *Likelihood* = 1, namun *Impact* tetap 3 karena jika terjadi maka service benar-benar tidak tersedia.
+- **"CloudAMQP single broker"** — awalnya dinilai rendah (skor 2). Setelah diskusi, disepakati sedang (skor 4) karena jika broker mati, seluruh alur async (notifikasi, sinkronisasi harga, penutupan lelang) berhenti sekaligus.
+
+Kesepakatan akhir: fokus mitigasi pada **4 risiko skor tertinggi** (skor 6) karena keempatnya paling actionable dalam scope semester ini tanpa perlu perubahan infrastruktur besar.
 
 ### 3. Mitigation
 
-*[Jelaskan solusi mitigasi yang dipilih untuk setiap risiko yang disepakati, mengapa solusi tersebut dipilih, dan hubungkan dengan perubahan arsitektur di Commit 2.]*
-
 | Risiko | Solusi Mitigasi | Perubahan Arsitektur |
 |---|---|---|
-| *[Isi setelah diskusi]* | | |
+| Frontend → 5 service langsung | Tambahkan **API Gateway** (Nginx/Kong) sebagai *reverse proxy* tunggal; frontend hanya butuh satu base URL; gateway yang handle routing, rate limiting, dan JWT validation | Ditambahkan container `API Gateway` antara Frontend dan kelima Backend Service |
+| Auction → Wallet REST sinkron (cascade failure) | Bungkus call dengan **Circuit Breaker** (Resilience4j `@CircuitBreaker`); definisikan fallback agar Auction tetap bisa merespons saat Wallet tidak tersedia sementara | Ditambahkan container `Circuit Breaker` antara Auction dan Wallet |
+| Auction → Catalog REST sinkron (cascade failure) | Sama seperti di atas — Circuit Breaker membungkus call Auction → Catalog dengan fallback | Circuit Breaker yang sama juga meng-cover call ke Catalog |
+| Tidak ada monitoring terpusat | Deploy **Prometheus** untuk scrape `/actuator/prometheus` tiap service + **Grafana** untuk dashboard dan alert rule (error rate > 1% atau p95 latency > 500ms) | Ditambahkan container `Monitoring Stack (Prometheus + Grafana)` dengan relasi scrape ke semua service |
 
 ## Individual Works
 
