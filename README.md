@@ -183,32 +183,87 @@ graph TB
 
 ## Future Architecture
 
-*[Tambahkan diagram]*
+Arsitektur masa depan BidMart ditentukan berdasarkan hasil *risk storming* tim. Tiga perubahan utama yang dilakukan adalah: menambahkan **API Gateway** sebagai *single entry point* agar frontend tidak langsung bergantung ke setiap service, menambahkan **Circuit Breaker** pada jalur sinkron kritis (Auction → Wallet dan Auction → Catalog) untuk mencegah *cascade failure*, dan menambahkan **Monitoring Stack** (Prometheus + Grafana) agar masalah dapat terdeteksi sebelum berdampak ke pengguna.
 
 ```mermaid
-%% TEMPLATE Salin dan modifikasi Container Diagram dari Commit 1
-%% Tambahkan komponen mitigasi seperti:
-%% - API Gateway / Load Balancer
-%% - CDN
-%% - Monitoring (Prometheus, Grafana)
-%% - Circuit Breaker
-%% - Database clustering / read replica
-%% - dll.
-
 C4Container
     title Future Architecture Diagram (Post Risk Storming)
-    %% [Isi dengan diagram hasil mitigasi risiko]
+
+    Person(seller, "Seller", "Penjual barang")
+    Person(buyer, "Buyer", "Pembeli / Bidder")
+    Person(admin, "Admin", "Pengelola operasional platform")
+
+    System_Boundary(bidmart, "BidMart Platform") {
+
+        Container(frontend, "Web Application", "Next.js, React, Tailwind", "Antarmuka utama bagi pengguna")
+
+        Container(gateway, "API Gateway", "Nginx / Kong", "Single entry point: routing, rate limiting, dan JWT validation")
+
+        Container(auth_api, "Auth Service", "Spring Boot 4.0.3", "Registrasi, login, JWT, 2FA")
+        ContainerDb(auth_db, "Auth DB", "PostgreSQL 16", "Data user, role & token")
+
+        Container(catalog_api, "Catalog Service", "Spring Boot 3.5.11", "Listing & sinkronisasi harga")
+        ContainerDb(catalog_db, "Catalog DB", "PostgreSQL 15", "Data listing & kategori")
+
+        Container(auction_api, "Auction Service", "Spring Boot 3.5.11", "Core lelang & anti-sniping")
+        ContainerDb(auction_db, "Auction DB", "Neon DB Serverless", "Data lelang & bid")
+        Container(redis, "Distributed Lock", "Upstash Redis", "Locking concurrent bid")
+        Container(cb, "Circuit Breaker", "Resilience4j", "Fallback untuk call sinkron Auction → Wallet & Catalog")
+
+        Container(wallet_api, "Wallet Service", "Spring Boot 3.3.2", "Top-up & hold saldo")
+        ContainerDb(wallet_db, "Wallet DB", "PostgreSQL", "Data saldo & transaksi")
+
+        Container(booking_api, "Booking Service", "Spring Boot 3.5.x", "Pesanan, notifikasi & sengketa")
+        ContainerDb(booking_db, "Booking DB", "PostgreSQL 16", "Data pesanan & shipment")
+
+        Container(mq, "Message Broker", "CloudAMQP RabbitMQ", "Event-driven broker")
+
+        Container(monitoring, "Monitoring Stack", "Prometheus + Grafana", "Scrape metrics tiap service, alert & dashboard")
+    }
+
+    Rel(seller, frontend, "Membuat listing & update pengiriman", "HTTPS")
+    Rel(buyer, frontend, "Mencari barang, bid, top-up & lacak pesanan", "HTTPS")
+    Rel(admin, frontend, "Kelola user, moderasi listing & tangani sengketa", "HTTPS")
+
+    Rel(frontend, gateway, "Semua request API", "REST/HTTPS")
+
+    Rel(gateway, auth_api, "Route auth requests", "REST/JSON")
+    Rel(gateway, catalog_api, "Route catalog requests", "REST/JSON")
+    Rel(gateway, auction_api, "Route auction requests", "REST/JSON")
+    Rel(gateway, wallet_api, "Route wallet requests", "REST/JSON")
+    Rel(gateway, booking_api, "Route booking requests", "REST/JSON")
+
+    Rel(auth_api, auth_db, "R/W user data", "SQL/TCP")
+    Rel(catalog_api, catalog_db, "R/W listing data", "SQL/TCP")
+    Rel(auction_api, auction_db, "R/W auction data", "SQL/TCP")
+    Rel(auction_api, redis, "Acquire/release lock", "RESP")
+    Rel(wallet_api, wallet_db, "R/W wallet data", "SQL/TCP")
+    Rel(booking_api, booking_db, "R/W booking data", "SQL/TCP")
+
+    Rel(auction_api, cb, "Call via circuit breaker", "Internal")
+    Rel(cb, wallet_api, "Hold/release saldo (dengan fallback)", "REST [POST]")
+    Rel(cb, catalog_api, "Validasi listing (dengan fallback)", "REST [GET]")
+
+    Rel(auth_api, mq, "Publish auth events", "AMQP")
+    Rel(auction_api, mq, "Publish auction events", "AMQP")
+    Rel(wallet_api, mq, "Publish wallet events", "AMQP")
+    Rel(catalog_api, mq, "Consume bid events", "AMQP")
+    Rel(booking_api, mq, "Consume closure & bid events", "AMQP")
+
+    Rel(monitoring, auth_api, "Scrape /actuator/prometheus", "HTTP")
+    Rel(monitoring, catalog_api, "Scrape /actuator/prometheus", "HTTP")
+    Rel(monitoring, auction_api, "Scrape /actuator/prometheus", "HTTP")
+    Rel(monitoring, wallet_api, "Scrape /actuator/prometheus", "HTTP")
+    Rel(monitoring, booking_api, "Scrape /actuator/prometheus", "HTTP")
 ```
 
-### Arsitektur Masa Depan BidMart
-
-*[Tambahkan deskripsi singkat perubahan arsitektur yang dilakukan]*
-
-**Perubahan dari Current ke Future Architecture:**
+### Perubahan dari Current ke Future Architecture
 
 | Area | Current | Future | Alasan |
 |---|---|---|---|
-| *[Isi setelah risk storming]* | | | |
+| Entry point frontend | Frontend memanggil 5 service langsung (5 IP/domain berbeda) | Semua request melalui satu **API Gateway** | Menghilangkan coupling frontend ke IP tiap service; satu titik untuk rate limiting & JWT validation |
+| Resiliensi Auction → Wallet/Catalog | Panggilan REST langsung tanpa fallback; jika Wallet/Catalog down, Auction ikut gagal | **Circuit Breaker** (Resilience4j) membungkus call sinkron dan menyediakan fallback response | Mencegah *cascade failure*: Auction tetap bisa merespons meski dependensi sementara hilang |
+| Observabilitas | Tidak ada monitoring terpusat; masalah hanya diketahui setelah user laporan | **Prometheus + Grafana** scrape `/actuator/prometheus` semua service; alert otomatis saat error rate / latency naik | Mendeteksi anomali lebih awal sebelum berdampak ke pengguna |
 
 ## Risk Storming Explanation
 
